@@ -877,8 +877,7 @@ impl UndoManager {
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        get_stack(&mut self.inner.lock().borrow_mut())
-                            .push(span.span, span.meta);
+                        get_stack(&mut self.inner.lock().borrow_mut()).push(span.span, span.meta);
                         return Err(e);
                     }
                 };
@@ -962,6 +961,21 @@ impl UndoManager {
 
     pub fn redo_count(&self) -> usize {
         self.inner.lock().borrow().redo_stack.len()
+    }
+
+    /// Counter range identifying the top history item, including at the stack limit.
+    pub fn top_span(&self, kind: UndoOrRedo) -> Option<CounterSpan> {
+        let inner = self.inner.lock();
+        let inner = inner.borrow();
+        let stack = match kind {
+            UndoOrRedo::Undo => &inner.undo_stack,
+            UndoOrRedo::Redo => &inner.redo_stack,
+        };
+        stack
+            .stack
+            .iter()
+            .rev()
+            .find_map(|(items, _)| items.back().map(|item| item.span))
     }
 
     /// Get the metadata of the top undo stack item, if any.

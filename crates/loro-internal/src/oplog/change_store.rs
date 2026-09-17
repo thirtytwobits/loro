@@ -307,22 +307,15 @@ impl ChangeStore {
         arena: &SharedArena,
         self_vv: &VersionVector,
     ) -> Result<Vec<Change>, LoroError> {
-        let change_store = ChangeStore::new_mem(arena, Arc::new(AtomicI64::new(0)));
+        let decoded_arena = SharedArena::new();
+        let change_store = ChangeStore::new_mem(&decoded_arena, Arc::new(AtomicI64::new(0)));
         let _ = change_store.import_all(bytes)?;
         let mut changes = Vec::new();
         change_store.visit_all_changes(&mut |c| {
-            let cnt_threshold = self_vv.get(&c.id.peer).copied().unwrap_or(0);
-            if c.id.counter >= cnt_threshold {
-                changes.push(c.clone());
-                return;
-            }
-
-            let change_end = c.ctr_end();
-            if change_end > cnt_threshold {
-                changes.push(c.slice((cnt_threshold - c.id.counter) as usize, c.atom_len()));
+            if let Some(change) = Self::retain_imported_change(c, &decoded_arena, arena, self_vv) {
+                changes.push(change);
             }
         });
-
         Ok(changes)
     }
 
@@ -331,24 +324,44 @@ impl ChangeStore {
         arena: &SharedArena,
         self_vv: &VersionVector,
     ) -> LoroResult<Vec<Change>> {
-        let mut ans = ChangesBlockBytes::new(bytes).parse(arena)?;
-        if ans.is_empty() {
-            return Ok(ans);
+        let decoded_arena = SharedArena::new();
+        Ok(ChangesBlockBytes::new(bytes)
+            .parse(&decoded_arena)?
+            .iter()
+            .filter_map(|c| Self::retain_imported_change(c, &decoded_arena, arena, self_vv))
+            .collect())
+    }
+
+    // Decode and validate in temporary storage. Only unseen operations belong
+    // in the document's append-only arena, including a partial change's suffix.
+    fn retain_imported_change(
+        change: &Change,
+        decoded_arena: &SharedArena,
+        arena: &SharedArena,
+        self_vv: &VersionVector,
+    ) -> Option<Change> {
+        let start = self_vv.get(&change.id.peer).copied().unwrap_or(0);
+        if change.ctr_end() <= start {
+            return None;
         }
-
-        let start = self_vv.get(&ans[0].peer()).copied().unwrap_or(0);
-        ans.retain_mut(|c| {
-            if c.id.counter >= start {
-                true
-            } else if c.ctr_end() > start {
-                *c = c.slice((start - c.id.counter) as usize, c.atom_len());
-                true
-            } else {
-                false
-            }
-        });
-
-        Ok(ans)
+        let mut change = if change.id.counter < start {
+            change.slice((start - change.id.counter) as usize, change.atom_len())
+        } else {
+            change.clone()
+        };
+        let remote = super::convert_change_to_remote(decoded_arena, &change);
+        let mut ops = RleVec::new();
+        for op in remote.ops.iter() {
+            ops.push(arena.convert_single_op(
+                &op.container,
+                change.id.peer,
+                op.counter,
+                change.lamport + (op.counter - change.id.counter) as Lamport,
+                op.content.clone(),
+            ));
+        }
+        change.ops = ops;
+        Some(change)
     }
 
     pub(crate) fn rollback_import(&self, rollback: ChangeStoreRollback) {
@@ -1972,6 +1985,49 @@ mod test {
             changes.push(convert_change_to_remote(&oplog.arena, c));
         });
         assert_eq!(changes_parsed, changes);
+    }
+
+    #[test]
+    fn repeated_binary_imports_retain_only_new_text_in_the_arena() {
+        for snapshots in [false, true] {
+            let source = LoroDoc::new_auto_commit();
+            let text = source.get_text("text");
+            let initial = "Long thought 🦊. ".repeat(1000);
+            text.insert_unicode(0, &initial).unwrap();
+            source.commit_then_renew();
+            let receiver = LoroDoc::new_auto_commit();
+            let export = |doc: &LoroDoc| {
+                doc.export(if snapshots {
+                    ExportMode::Snapshot
+                } else {
+                    ExportMode::all_updates()
+                })
+                .unwrap()
+            };
+            receiver.import(&export(&source)).unwrap();
+            let retained = receiver.oplog.lock().arena.utf16_len();
+            for _ in 0..20 {
+                receiver.import(&export(&source)).unwrap();
+                assert_eq!(
+                    receiver.oplog.lock().arena.utf16_len(),
+                    retained,
+                    "Duplicate history must not allocate retained text"
+                );
+            }
+            let suffix = " later 🦊";
+            text.insert_unicode(text.len_unicode(), suffix).unwrap();
+            source.commit_then_renew();
+            receiver.import(&export(&source)).unwrap();
+            assert_eq!(
+                receiver.get_text("text").to_string(),
+                initial.clone() + suffix
+            );
+            assert_eq!(
+                receiver.oplog.lock().arena.utf16_len(),
+                retained + suffix.encode_utf16().count(),
+                "Overlapping history must allocate only the new suffix"
+            );
+        }
     }
 
     #[test]

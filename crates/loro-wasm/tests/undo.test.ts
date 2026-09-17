@@ -3,6 +3,31 @@ import { describe, expect, test } from "vitest";
 import { expectDefined } from "./helpers";
 
 describe("undo", () => {
+  test("history metadata survives eviction at the undo limit", () => {
+    const doc = new LoroDoc();
+    const text = doc.getText("text");
+    let before = 0;
+    let restored: { value: unknown; cursors: Cursor[] } | undefined;
+    const undo = new UndoManager(doc, {
+      maxUndoSteps: 3, mergeInterval: 0,
+      onPush: () => ({ value: before, cursors: [text.getCursor(before)!] }),
+      onPop: (_kind, meta) => { restored = meta; }
+    });
+    for (let i = 0; i < 10; i++) {
+      before = text.length;
+      text.insert(before, "x");
+      doc.commit();
+    }
+    for (let i = 0; i < 3; i++) {
+      const length = text.length;
+      expect(undo.undo()).toBe(true);
+      expect(restored?.value).toBe(length - 1);
+      expect(restored?.cursors.length).toBe(1);
+    }
+    expect(undo.undo()).toBe(false);
+    undo.free();
+  });
+
   test("basic text undo", () => {
     const doc = new LoroDoc();
     doc.setPeerId(1);
